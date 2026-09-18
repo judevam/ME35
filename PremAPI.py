@@ -19,8 +19,8 @@ SERVO_MINUTE_MIN_NS = 500_000
 SERVO_MINUTE_MAX_NS = 2_500_000
 
 DEBOUNCE_MS = 200
-MATCH_DISPLAY_SECONDS = 15   # how long to hold the team positions before returning to clock mode
-CLOCK_UPDATE_SECONDS = 15    # how often to nudge the hands while in clock mode
+MATCH_DISPLAY_SECONDS = 10   # how long to hold the team positions before returning to clock mode
+CLOCK_UPDATE_SECONDS = 10    # how often to nudge the hands while in clock mode
 
 # Premier League clubs for the 2026-27 season, alphabetical -> index is that team's position along the belt.
 # Update this list at the start of each season (promotions/relegations).
