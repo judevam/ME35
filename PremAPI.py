@@ -5,24 +5,24 @@ import time
 from machine import Pin, PWM
 
 # ---------------------------------------------------------------------------
-# EDIT THESE to match your wiring and belt calibration
+# EDIT THESE to match your wiring and gearing
 # ---------------------------------------------------------------------------
-PIN_SERVO_HOUR = 4        # servo driving the belt for the "hour" hand
-PIN_SERVO_MINUTE = 18     # servo driving the belt for the "minute" hand
+PIN_SERVO = 18            # single servo, geared up to sweep a full 360 degrees
+PIN_LED_HOME = 19         # lights up while pointing at the home team
+PIN_LED_AWAY = 21         # lights up while pointing at the away team
 PIN_BUTTON = 34           # button that triggers "show next match" mode
 
-# Pulse width (ns) at each end of belt travel. Swap min/max per servo if a
-# belt runs backwards relative to the other.
-SERVO_HOUR_MIN_NS = 500_000
-SERVO_HOUR_MAX_NS = 2_500_000
-SERVO_MINUTE_MIN_NS = 500_000
-SERVO_MINUTE_MAX_NS = 2_500_000
+# Pulse width (ns) at each end of the servo's own travel (e.g. 0-180 degrees
+# on the servo itself), which the gearing turns into a full 0-360 degree
+# sweep of the clock hand/pointer.
+SERVO_MIN_NS = 500_000
+SERVO_MAX_NS = 2_500_000
 
 DEBOUNCE_MS = 200
-MATCH_DISPLAY_SECONDS = 10   # how long to hold the team positions before returning to clock mode
-CLOCK_UPDATE_SECONDS = 10    # how often to nudge the hands while in clock mode
+TEAM_DISPLAY_SECONDS = 4     # how long to hold on each team before moving to the next
+CLOCK_UPDATE_SECONDS = 10    # how often to nudge the hand while in clock mode
 
-# Premier League clubs for the 2026-27 season, alphabetical -> index is that team's position along the belt.
+# Premier League clubs for the 2026-27 season, alphabetical -> index is that team's position around the dial.
 # Update this list at the start of each season (promotions/relegations).
 PREMIER_LEAGUE_TEAMS = sorted([
     "Arsenal", "Aston Villa", "AFC Bournemouth", "Brentford", "Brighton & Hove Albion",
@@ -32,25 +32,23 @@ PREMIER_LEAGUE_TEAMS = sorted([
 ])
 
 # ---------------------------------------------------------------------------
-# Servos
+# Servo + LEDs
 # ---------------------------------------------------------------------------
-hour_servo = PWM(Pin(PIN_SERVO_HOUR), freq=50, duty_u16=0)
-minute_servo = PWM(Pin(PIN_SERVO_MINUTE), freq=50, duty_u16=0)
+servo = PWM(Pin(PIN_SERVO), freq=50, duty_u16=0)
+led_home = Pin(PIN_LED_HOME, Pin.OUT, value=0)
+led_away = Pin(PIN_LED_AWAY, Pin.OUT, value=0)
 
 
-def set_position(servo, fraction, min_ns, max_ns):
-    """Drive a belt servo to `fraction` (0.0-1.0) of its travel range."""
+def set_position(fraction):
+    """Point the (geared, 360-degree) servo to `fraction` (0.0-1.0) of a full turn."""
     fraction = max(0.0, min(1.0, fraction))
-    pulse_ns = int(min_ns + fraction * (max_ns - min_ns))
+    pulse_ns = int(SERVO_MIN_NS + fraction * (SERVO_MAX_NS - SERVO_MIN_NS))
     servo.duty_ns(pulse_ns)
 
 
-def set_hour_position(fraction):
-    set_position(hour_servo, fraction, SERVO_HOUR_MIN_NS, SERVO_HOUR_MAX_NS)
-
-
-def set_minute_position(fraction):
-    set_position(minute_servo, fraction, SERVO_MINUTE_MIN_NS, SERVO_MINUTE_MAX_NS)
+def leds_off():
+    led_home.value(0)
+    led_away.value(0)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +151,7 @@ def normalize_team(name):
 
 
 def team_fraction(team_name):
-    """Map a team name to its 0.0-1.0 position along the belt (alphabetical order)."""
+    """Map a team name to its 0.0-1.0 position around the dial (alphabetical order)."""
     target = normalize_team(team_name)
     for i, name in enumerate(PREMIER_LEAGUE_TEAMS):
         known = normalize_team(name)
@@ -168,8 +166,18 @@ def show_next_match(now_ts):
     if result is None:
         return
     home, away = result
-    set_hour_position(team_fraction(home))
-    set_minute_position(team_fraction(away))
+
+    leds_off()
+    set_position(team_fraction(home))
+    led_home.value(1)
+    time.sleep(TEAM_DISPLAY_SECONDS)
+
+    leds_off()
+    set_position(team_fraction(away))
+    led_away.value(1)
+    time.sleep(TEAM_DISPLAY_SECONDS)
+
+    leds_off()
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +204,8 @@ button.irq(trigger=Pin.IRQ_FALLING, handler=button_handler)
 # ---------------------------------------------------------------------------
 def show_clock(utc_ts):
     t = time.gmtime(utc_ts)  # (year, month, mday, hour, minute, second, ...)
-    hour, minute = t[3], t[4]
-    hour_fraction = ((hour % 12) + minute / 60) / 12
-    minute_fraction = minute / 60
-    set_hour_position(hour_fraction)
-    set_minute_position(minute_fraction)
+    minute = t[4]
+    set_position(minute / 60)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +232,6 @@ while True:
     if match_requested:
         match_requested = False
         show_next_match(current_time())
-        time.sleep(MATCH_DISPLAY_SECONDS)
     else:
         show_clock(current_time())
         time.sleep(CLOCK_UPDATE_SECONDS)
