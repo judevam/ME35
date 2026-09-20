@@ -1,26 +1,39 @@
-import urequests
-import secrets
 import gc
 import time
+import secrets
+import urequests
 from machine import Pin, PWM
 
 # ---------------------------------------------------------------------------
 # EDIT THESE to match your wiring and gearing
 # ---------------------------------------------------------------------------
-PIN_SERVO = 18            # single servo, geared up to sweep a full 360 degrees
-PIN_LED_HOME = 19         # lights up while pointing at the home team
-PIN_LED_AWAY = 21         # lights up while pointing at the away team
+PIN_SERVO_HOUR = 4        # servo driving the hour hand, geared 2:1 for a 360-degree sweep
+PIN_SERVO_MINUTE = 5      # servo driving the minute hand, geared 2:1 for a 360-degree sweep
+PIN_LED_MODE = 22         # on while showing the PL matchup, off while showing normal time
 PIN_BUTTON = 34           # button that triggers "show next match" mode
 
-# Pulse width (ns) at each end of the servo's own travel (e.g. 0-180 degrees
-# on the servo itself), which the gearing turns into a full 0-360 degree
-# sweep of the clock hand/pointer.
-SERVO_MIN_NS = 500_000
-SERVO_MAX_NS = 2_500_000
+# Pulse width (ns) at each end of the servo's own travel (0-180 degrees on
+# the servo itself), which the 2:1 gearing turns into a full 0-360 degree
+# sweep of the clock hand. Swap min/max per servo if one runs backwards
+# relative to the other.
+SERVO_HOUR_MIN_NS = 500_000
+SERVO_HOUR_MAX_NS = 2_500_000
+SERVO_MINUTE_MIN_NS = 500_000
+SERVO_MINUTE_MAX_NS = 2_500_000
+
+# Calibration: degrees added to the commanded angle to correct for how the
+# horn/gear landed when it was mounted. Set via calibrate_servos() — command
+# fraction 0.0, measure how far off true 12 o'clock the hand sits and which
+# way, then adjust this value and re-run calibrate_servos() to confirm. If
+# nudging it the "obvious" direction makes it worse, this rig's gearing
+# inverts rotation sense, so flip the sign instead.
+SERVO_HOUR_OFFSET_DEG = 35.0
+SERVO_MINUTE_OFFSET_DEG = 50.0
 
 DEBOUNCE_MS = 200
-TEAM_DISPLAY_SECONDS = 4     # how long to hold on each team before moving to the next
-CLOCK_UPDATE_SECONDS = 10    # how often to nudge the hand while in clock mode
+MATCH_DISPLAY_SECONDS = 10   # how long to hold the team positions before returning to clock mode
+CLOCK_UPDATE_SECONDS = 10    # how often to nudge the hands while in clock mode
+STARTUP_TEST_STEP_SECONDS = 1.5   # pause between each position during the startup hand test
 
 # Premier League clubs for the 2026-27 season, alphabetical -> index is that team's position around the dial.
 # Update this list at the start of each season (promotions/relegations).
@@ -32,23 +45,33 @@ PREMIER_LEAGUE_TEAMS = sorted([
 ])
 
 # ---------------------------------------------------------------------------
-# Servo + LEDs
+# Servos + LEDs
 # ---------------------------------------------------------------------------
-servo = PWM(Pin(PIN_SERVO), freq=50, duty_u16=0)
-led_home = Pin(PIN_LED_HOME, Pin.OUT, value=0)
-led_away = Pin(PIN_LED_AWAY, Pin.OUT, value=0)
+hour_servo = PWM(Pin(PIN_SERVO_HOUR), freq=50, duty_u16=0)
+minute_servo = PWM(Pin(PIN_SERVO_MINUTE), freq=50, duty_u16=0)
+led_mode = Pin(PIN_LED_MODE, Pin.OUT, value=0)
 
 
-def set_position(fraction):
-    """Point the (geared, 360-degree) servo to `fraction` (0.0-1.0) of a full turn."""
-    fraction = max(0.0, min(1.0, fraction))
-    pulse_ns = int(SERVO_MIN_NS + fraction * (SERVO_MAX_NS - SERVO_MIN_NS))
+def log(msg):
+    t = time.gmtime(current_time())
+    print("[{:02d}:{:02d}:{:02d}] {}".format(t[3], t[4], t[5], msg))
+
+
+def set_position(servo, fraction, min_ns, max_ns, offset_deg, label):
+    """Point a geared, 360-degree servo to `fraction` (0.0-1.0) of a full turn,
+    shifted by `offset_deg` to correct for how it was mounted."""
+    adjusted = (fraction + offset_deg / 360.0) % 1.0
+    pulse_ns = int(min_ns + adjusted * (max_ns - min_ns))
     servo.duty_ns(pulse_ns)
+    log(f"{label} servo -> {adjusted * 360:.1f} deg (target {fraction * 360:.1f} deg, offset {offset_deg:+.1f})")
 
 
-def leds_off():
-    led_home.value(0)
-    led_away.value(0)
+def set_hour_position(fraction):
+    set_position(hour_servo, fraction, SERVO_HOUR_MIN_NS, SERVO_HOUR_MAX_NS, SERVO_HOUR_OFFSET_DEG, label="Hour")
+
+
+def set_minute_position(fraction):
+    set_position(minute_servo, fraction, SERVO_MINUTE_MIN_NS, SERVO_MINUTE_MAX_NS, SERVO_MINUTE_OFFSET_DEG, label="Minute")
 
 
 # ---------------------------------------------------------------------------
@@ -162,22 +185,19 @@ def team_fraction(team_name):
 
 
 def show_next_match(now_ts):
+    """Hour hand points at the home team, minute hand points at the away team."""
     result = get_next_match(now_ts)
     if result is None:
         return
     home, away = result
+    log(f"Button pressed -> showing matchup: {home} (hour hand) vs {away} (minute hand)")
 
-    leds_off()
-    set_position(team_fraction(home))
-    led_home.value(1)
-    time.sleep(TEAM_DISPLAY_SECONDS)
-
-    leds_off()
-    set_position(team_fraction(away))
-    led_away.value(1)
-    time.sleep(TEAM_DISPLAY_SECONDS)
-
-    leds_off()
+    led_mode.value(1)
+    set_hour_position(team_fraction(home))
+    set_minute_position(team_fraction(away))
+    time.sleep(MATCH_DISPLAY_SECONDS)
+    led_mode.value(0)
+    log("Matchup display done -> returning to clock")
 
 
 # ---------------------------------------------------------------------------
@@ -200,12 +220,77 @@ button.irq(trigger=Pin.IRQ_FALLING, handler=button_handler)
 
 
 # ---------------------------------------------------------------------------
-# Clock mode
+# Clock mode - normal two-hand clock
 # ---------------------------------------------------------------------------
 def show_clock(utc_ts):
     t = time.gmtime(utc_ts)  # (year, month, mday, hour, minute, second, ...)
-    minute = t[4]
-    set_position(minute / 60)
+    hour, minute = t[3], t[4]
+    hour_fraction = ((hour % 12) + minute / 60) / 12
+    minute_fraction = minute / 60
+    log("Clock update -> {:d}:{:02d}".format(hour % 12 or 12, minute))
+    set_hour_position(hour_fraction)
+    set_minute_position(minute_fraction)
+
+
+def test_clock_hands():
+    """One-time startup sanity check: sweep each hand through a few known positions.
+
+    Uses a continuously increasing fraction (0.0 -> 1.0) rather than wrapping
+    back to 0.0 for the final "12"/"60" mark. Fraction 0.0 and 1.0 land on the
+    same visual spot but are different physical servo angles (0 deg vs 180 deg,
+    since it's geared 2:1) - commanding 0.0 from mid-swing would yank the
+    servo all the way backward instead of finishing the turn forward.
+    """
+    log("Startup test: sweeping hour hand through 12, 3, 6, 9, 12")
+    for label, fraction in (("12", 0.0), ("3", 0.25), ("6", 0.5), ("9", 0.75), ("12", 1.0)):
+        log(f"Hour hand target: {label} o'clock")
+        set_hour_position(fraction)
+        time.sleep(STARTUP_TEST_STEP_SECONDS)
+
+    log("Startup test: sweeping minute hand through 15, 30, 45, 60")
+    for label, fraction in (("15", 0.25), ("30", 0.5), ("45", 0.75), ("60", 1.0)):
+        log(f"Minute hand target: {label}")
+        set_minute_position(fraction)
+        time.sleep(STARTUP_TEST_STEP_SECONDS)
+
+    log("Startup test complete")
+
+
+def calibrate_servos():
+    """Park both hands at fraction 0.0 (should be true 12 o'clock) and hold,
+    so you can measure how far off each one physically sits.
+
+    Usage: temporarily call this instead of test_clock_hands() in Main below,
+    flash it, then measure each hand against the 12 o'clock mark:
+      - How many degrees off is it, and which way (clockwise/counter-clockwise)?
+    Report those two numbers and I'll set SERVO_HOUR_OFFSET_DEG /
+    SERVO_MINUTE_OFFSET_DEG for you. Ctrl+C out of this once you've measured.
+    """
+    log("CALIBRATION: parking hour + minute hands at fraction 0.0 (true 12 o'clock)")
+    set_hour_position(0.0)
+    set_minute_position(0.0)
+    log("Hands parked - measure the offset on each, then Ctrl+C and report back")
+    while True:
+        time.sleep(1)
+
+
+def probe_servo_range(servo, label, start_ns=300_000, end_ns=2_700_000, step_ns=100_000, step_seconds=1.0):
+    """Sweep raw pulse widths on one servo, ignoring fraction/offset math, so
+    you can find where it actually stalls/buzzes at each end.
+
+    Usage: temporarily call e.g. probe_servo_range(hour_servo, "Hour") instead
+    of test_clock_hands() in Main below. Watch/listen for the pulse width
+    where it stops moving cleanly (grinds, buzzes, or the hand just stops).
+    Report the ns value at each end and I'll set SERVO_HOUR_MIN_NS/MAX_NS (or
+    the minute equivalents) a little inside those limits, so the fraction
+    math never asks for a pulse the servo can't actually reach.
+    """
+    ns = start_ns
+    while ns <= end_ns:
+        servo.duty_ns(ns)
+        log(f"{label} raw pulse -> {ns} ns")
+        time.sleep(step_seconds)
+        ns += step_ns
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +313,10 @@ def current_time():
 
 gc.collect()
 
+test_clock_hands()
+
+#calibrate_servos()
+
 while True:
     if match_requested:
         match_requested = False
@@ -235,3 +324,4 @@ while True:
     else:
         show_clock(current_time())
         time.sleep(CLOCK_UPDATE_SECONDS)
+
