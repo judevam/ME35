@@ -2,15 +2,18 @@ import gc
 import time
 import secrets
 import urequests
+import neopixel
 from machine import Pin, PWM
 
 # ---------------------------------------------------------------------------
-# EDIT THESE to match your wiring and gearing
+# EDIT
 # ---------------------------------------------------------------------------
 PIN_SERVO_HOUR = 4        # servo driving the hour hand, geared 2:1 for a 360-degree sweep
 PIN_SERVO_MINUTE = 5      # servo driving the minute hand, geared 2:1 for a 360-degree sweep
-PIN_LED_MODE = 22         # on while showing the PL matchup, off while showing normal time
-PIN_BUTTON = 34           # button that triggers "show next match" mode
+PIN_NEOPIXEL = 15         # D15 - lights up while showing the PL matchup, off while showing normal time
+NUM_NEOPIXELS = 1         # how many pixels are on that strip/ring
+NEOPIXEL_MATCH_COLOR = (0, 255, 0)   # (R, G, B) color while showing a matchup
+PIN_BUTTON = 34           # D34 on the robo board - button that triggers "show next match" mode
 
 # Pulse width (ns) at each end of the servo's own travel (0-180 degrees on
 # the servo itself), which the 2:1 gearing turns into a full 0-360 degree
@@ -27,29 +30,53 @@ SERVO_MINUTE_MAX_NS = 2_500_000
 # way, then adjust this value and re-run calibrate_servos() to confirm. If
 # nudging it the "obvious" direction makes it worse, this rig's gearing
 # inverts rotation sense, so flip the sign instead.
-SERVO_HOUR_OFFSET_DEG = 35.0
+SERVO_HOUR_OFFSET_DEG = 40.0
 SERVO_MINUTE_OFFSET_DEG = 50.0
+
+# Calibration: multiplier on the commanded angle to correct a proportional
+# under/over-rotation (e.g. the real gear ratio isn't exactly 2:1). Found by
+# jogging to a known angle (see ServoTest.py) and comparing to the measured
+# result: scale = commanded_degrees / actual_measured_degrees.
+SERVO_HOUR_SCALE = 1.08
+SERVO_MINUTE_SCALE = 1.0
 
 DEBOUNCE_MS = 200
 MATCH_DISPLAY_SECONDS = 10   # how long to hold the team positions before returning to clock mode
 CLOCK_UPDATE_SECONDS = 10    # how often to nudge the hands while in clock mode
 STARTUP_TEST_STEP_SECONDS = 1.5   # pause between each position during the startup hand test
 
-# Premier League clubs for the 2026-27 season, alphabetical -> index is that team's position around the dial.
-# Update this list at the start of each season (promotions/relegations).
-PREMIER_LEAGUE_TEAMS = sorted([
-    "Arsenal", "Aston Villa", "AFC Bournemouth", "Brentford", "Brighton & Hove Albion",
-    "Chelsea", "Coventry City", "Crystal Palace", "Everton", "Fulham",
-    "Hull City", "Ipswich Town", "Leeds United", "Liverpool", "Manchester City",
-    "Manchester United", "Newcastle United", "Nottingham Forest", "Sunderland", "Tottenham Hotspur",
-])
+# Premier League clubs in physical clockwise order around the dial, starting
+# from the marker nearest 12 o'clock. This is NOT alphabetical - it matches
+# how the teams are actually printed on the face. Update this if the face is
+# ever redone (e.g. promotions/relegations changing which teams are on it).
+PREMIER_LEAGUE_TEAMS = [
+    "Manchester City", "Arsenal", "Hull City", "Chelsea", "Brentford",
+    "Liverpool", "Newcastle United", "Everton", "Leeds United", "Brighton & Hove Albion",
+    "Manchester United", "Sunderland", "Crystal Palace", "Ipswich Town", "AFC Bournemouth",
+    "Nottingham Forest", "Tottenham Hotspur", "Aston Villa", "Fulham", "Coventry City",
+]
+
+# Calibration: degrees added to every team's dial position, to correct for
+# how the printed face sits relative to true 12 o'clock (independent of the
+# hour/minute servo mounting offsets above - this is about the face artwork,
+# shared by both hands since they point at the same team ring). Found the
+# same way as the servo offsets: point at team index 0 (first team above),
+# measure how far off true 12 it sits and which way, then adjust.
+TEAM_DIAL_OFFSET_DEG = 0.0
 
 # ---------------------------------------------------------------------------
 # Servos + LEDs
 # ---------------------------------------------------------------------------
 hour_servo = PWM(Pin(PIN_SERVO_HOUR), freq=50, duty_u16=0)
 minute_servo = PWM(Pin(PIN_SERVO_MINUTE), freq=50, duty_u16=0)
-led_mode = Pin(PIN_LED_MODE, Pin.OUT, value=0)
+mode_pixels = neopixel.NeoPixel(Pin(PIN_NEOPIXEL), NUM_NEOPIXELS)
+
+
+def set_mode_led(on):
+    color = NEOPIXEL_MATCH_COLOR if on else (0, 0, 0)
+    for i in range(NUM_NEOPIXELS):
+        mode_pixels[i] = color
+    mode_pixels.write()
 
 
 def log(msg):
@@ -57,21 +84,22 @@ def log(msg):
     print("[{:02d}:{:02d}:{:02d}] {}".format(t[3], t[4], t[5], msg))
 
 
-def set_position(servo, fraction, min_ns, max_ns, offset_deg, label):
+def set_position(servo, fraction, min_ns, max_ns, offset_deg, scale, label):
     """Point a geared, 360-degree servo to `fraction` (0.0-1.0) of a full turn,
-    shifted by `offset_deg` to correct for how it was mounted."""
-    adjusted = (fraction + offset_deg / 360.0) % 1.0
+    corrected by `scale` (proportional under/over-rotation) then shifted by
+    `offset_deg` (to correct for how it was mounted)."""
+    adjusted = (fraction * scale + offset_deg / 360.0) % 1.0
     pulse_ns = int(min_ns + adjusted * (max_ns - min_ns))
     servo.duty_ns(pulse_ns)
-    log(f"{label} servo -> {adjusted * 360:.1f} deg (target {fraction * 360:.1f} deg, offset {offset_deg:+.1f})")
+    log(f"{label} servo -> {adjusted * 360:.1f} deg (target {fraction * 360:.1f} deg, scale {scale:.3f}, offset {offset_deg:+.1f})")
 
 
 def set_hour_position(fraction):
-    set_position(hour_servo, fraction, SERVO_HOUR_MIN_NS, SERVO_HOUR_MAX_NS, SERVO_HOUR_OFFSET_DEG, label="Hour")
+    set_position(hour_servo, fraction, SERVO_HOUR_MIN_NS, SERVO_HOUR_MAX_NS, SERVO_HOUR_OFFSET_DEG, SERVO_HOUR_SCALE, label="Hour")
 
 
 def set_minute_position(fraction):
-    set_position(minute_servo, fraction, SERVO_MINUTE_MIN_NS, SERVO_MINUTE_MAX_NS, SERVO_MINUTE_OFFSET_DEG, label="Minute")
+    set_position(minute_servo, fraction, SERVO_MINUTE_MIN_NS, SERVO_MINUTE_MAX_NS, SERVO_MINUTE_OFFSET_DEG, SERVO_MINUTE_SCALE, label="Minute")
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +202,19 @@ def normalize_team(name):
 
 
 def team_fraction(team_name):
-    """Map a team name to its 0.0-1.0 position around the dial (alphabetical order)."""
+    """Map a team name to its 0.0-1.0 position around the dial (physical clockwise order).
+
+    Divides by len(teams), not len(teams) - 1: this is a circular dial, so
+    fraction 0.0 and 1.0 are the same physical spot. Dividing by the count
+    (not count - 1) spaces all 20 teams evenly around the full circle without
+    the first and last team landing on top of each other. TEAM_DIAL_OFFSET_DEG
+    then shifts the whole ring to match where it actually sits on the face.
+    """
     target = normalize_team(team_name)
     for i, name in enumerate(PREMIER_LEAGUE_TEAMS):
         known = normalize_team(name)
         if known == target or known in target or target in known:
-            return i / (len(PREMIER_LEAGUE_TEAMS) - 1)
+            return (i / len(PREMIER_LEAGUE_TEAMS) + TEAM_DIAL_OFFSET_DEG / 360.0) % 1.0
     print("Unknown team, not in PREMIER_LEAGUE_TEAMS list:", team_name)
     return 0.5  # park in the middle if we don't recognize the name
 
@@ -192,11 +227,11 @@ def show_next_match(now_ts):
     home, away = result
     log(f"Button pressed -> showing matchup: {home} (hour hand) vs {away} (minute hand)")
 
-    led_mode.value(1)
+    set_mode_led(True)
     set_hour_position(team_fraction(home))
     set_minute_position(team_fraction(away))
     time.sleep(MATCH_DISPLAY_SECONDS)
-    led_mode.value(0)
+    set_mode_led(False)
     log("Matchup display done -> returning to clock")
 
 
