@@ -3,8 +3,9 @@ from machine import Pin, PWM
 
 # ---------------------------------------------------------------------------
 # Standalone servo calibration rig - no wifi, no time sync, no API calls.
-# Copy calibrated values (SERVO_*_MIN_NS/MAX_NS/OFFSET_DEG) into PremAPI.py
-# once you're happy with them here.
+# Copy calibrated values into PremAPI.py once you're happy with them here:
+# SERVO_HOUR_MIN_NS/MAX_NS/OFFSET_DEG/SCALE for the hour hand, and the whole
+# MINUTE_CALIBRATION table for the minute hand.
 # ---------------------------------------------------------------------------
 PIN_SERVO_HOUR = 4        # servo driving the hour hand, geared 2:1 for a 360-degree sweep
 PIN_SERVO_MINUTE = 5      # servo driving the minute hand, geared 2:1 for a 360-degree sweep
@@ -15,21 +16,39 @@ PIN_SERVO_MINUTE = 5      # servo driving the minute hand, geared 2:1 for a 360-
 # relative to the other.
 SERVO_HOUR_MIN_NS = 500_000
 SERVO_HOUR_MAX_NS = 2_500_000
-SERVO_MINUTE_MIN_NS = 500_000
-SERVO_MINUTE_MAX_NS = 2_500_000
 
 # Calibration: degrees added to the commanded angle to correct for how the
 # horn/gear landed when it was mounted. See calibrate_servos() below.
-SERVO_HOUR_OFFSET_DEG = 40.0
-SERVO_MINUTE_OFFSET_DEG = 50.0
+# Only used for the hour servo - the minute servo's calibration is the
+# MINUTE_CALIBRATION table below instead.
+SERVO_HOUR_OFFSET_DEG = 315.0
 
 # Calibration: multiplier on the commanded angle to correct a proportional
 # under/over-rotation (e.g. the real gear ratio isn't exactly 2:1). Found by
 # jogging to a known angle and comparing to the measured result:
 #   scale = commanded_degrees / actual_measured_degrees
 # e.g. jogged hour to 270, it actually landed at 250 -> 270/250 = 1.08.
-SERVO_HOUR_SCALE = 1.08
-SERVO_MINUTE_SCALE = 1.0
+# Only used for the hour servo now - the minute servo's response turned out
+# to be non-linear (see MINUTE_CALIBRATION below), so a single scale number
+# can't describe it and it uses a measured table + interpolation instead.
+SERVO_HOUR_SCALE = 1.0
+
+# Calibration table for the minute servo: measured (minute-mark, pulse ns)
+# points from raw-pulse probing (see probe_servo_range / set_raw_pulse),
+# since it takes progressively more ns per minute as the pulse gets longer -
+# not a straight line. The floor of this servo's pulse range (~300,000ns)
+# lands at minute 13, not minute 0, so minutes 0-13 are unreachable on this
+# lap; they're reached instead by continuing a bit past a full turn, which is
+# why the table goes up to "minute 75" (= minute 15 of the next lap around).
+# Re-measure and update this if the servo/gearing/mounting ever changes.
+MINUTE_CALIBRATION = [
+    (13, 300_000),
+    (15, 390_000),
+    (30, 850_000),
+    (45, 1_450_000),
+    (60, 2_000_000),
+    (75, 2_450_000),
+]
 
 STEP_SECONDS = 1.5   # pause between each position during test_clock_hands()
 TEAM_STEP_SECONDS = 2.0   # pause on each team during test_team_positions()
@@ -77,8 +96,29 @@ def set_hour_position(fraction):
     set_position(hour_servo, fraction, SERVO_HOUR_MIN_NS, SERVO_HOUR_MAX_NS, SERVO_HOUR_OFFSET_DEG, SERVO_HOUR_SCALE, label="Hour")
 
 
+def interpolate_ns(table, x):
+    """Piecewise-linear lookup: find where x falls between two calibrated
+    (x, ns) points and interpolate, instead of assuming one straight line
+    across the whole range like set_position does."""
+    for (x0, ns0), (x1, ns1) in zip(table, table[1:]):
+        if x0 <= x <= x1:
+            t = (x - x0) / (x1 - x0)
+            return ns0 + t * (ns1 - ns0)
+    return table[0][1] if x < table[0][0] else table[-1][1]
+
+
 def set_minute_position(fraction):
-    set_position(minute_servo, fraction, SERVO_MINUTE_MIN_NS, SERVO_MINUTE_MAX_NS, SERVO_MINUTE_OFFSET_DEG, SERVO_MINUTE_SCALE, label="Minute")
+    """Point the minute hand using the measured MINUTE_CALIBRATION table
+    instead of a straight-line formula. Minutes 0-13 fall below this servo's
+    real pulse floor, so they're looked up as "minute + 60" instead - reached
+    by continuing a bit past a full turn rather than a low pulse."""
+    minute = fraction * 60
+    low_minute = MINUTE_CALIBRATION[0][0]
+    if minute < low_minute:
+        minute += 60
+    pulse_ns = int(interpolate_ns(MINUTE_CALIBRATION, minute))
+    minute_servo.duty_ns(pulse_ns)
+    log(f"Minute servo -> target {fraction * 360:.1f} deg ({fraction * 60:.1f} min), pulse {pulse_ns} ns")
 
 
 # ---------------------------------------------------------------------------
@@ -89,9 +129,10 @@ def calibrate_servos():
     so you can measure how far off each one physically sits.
 
     Measure each hand against the 12 o'clock mark: how many degrees off, and
-    which way (clockwise/counter-clockwise). Update SERVO_HOUR_OFFSET_DEG /
-    SERVO_MINUTE_OFFSET_DEG above with the correction, then run this again to
-    confirm. Ctrl+C out of this once you've measured.
+    which way (clockwise/counter-clockwise). Update SERVO_HOUR_OFFSET_DEG (for
+    the hour hand) or the first MINUTE_CALIBRATION point (for the minute
+    hand) with the correction, then run this again to confirm. Ctrl+C out of
+    this once you've measured.
     """
     log("CALIBRATION: parking hour + minute hands at fraction 0.0 (true 12 o'clock)")
     set_hour_position(0.0)
@@ -116,6 +157,15 @@ def probe_servo_range(servo, label, start_ns=300_000, end_ns=2_700_000, step_ns=
         log(f"{label} raw pulse -> {ns} ns")
         time.sleep(step_seconds)
         ns += step_ns
+
+
+def set_raw_pulse(servo, ns):
+    """Set one exact pulse width directly, no fraction/offset/scale math at
+    all. For pinning down precise ns values (e.g. exactly where true 12
+    o'clock or a specific minute mark lands) tighter than probe_servo_range's
+    fixed step size lets you."""
+    servo.duty_ns(ns)
+    log(f"Raw pulse -> {ns} ns")
 
 
 def test_clock_hands():
@@ -186,13 +236,11 @@ def point_at_team(servo_name, team_name):
 
 def jog(servo_name, degrees):
     """Nudge one hand to an exact angle (0-360) for fine-tuning by hand."""
-    servo = hour_servo if servo_name == "hour" else minute_servo
-    offset = SERVO_HOUR_OFFSET_DEG if servo_name == "hour" else SERVO_MINUTE_OFFSET_DEG
-    scale = SERVO_HOUR_SCALE if servo_name == "hour" else SERVO_MINUTE_SCALE
-    min_ns = SERVO_HOUR_MIN_NS if servo_name == "hour" else SERVO_MINUTE_MIN_NS
-    max_ns = SERVO_HOUR_MAX_NS if servo_name == "hour" else SERVO_MINUTE_MAX_NS
-    label = "Hour" if servo_name == "hour" else "Minute"
-    set_position(servo, (degrees % 360) / 360.0, min_ns, max_ns, offset, scale, label)
+    fraction = (degrees % 360) / 360.0
+    if servo_name == "hour":
+        set_hour_position(fraction)
+    else:
+        set_minute_position(fraction)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +256,7 @@ Servo test menu:
   6) jog minute to N degrees  - fine-tune a single angle
   7) test_team_positions()    - sweep both hands through all 20 team markers
   8) point at one team        - point a single hand at one named team
+  9) set raw pulse (ns)       - dial in one exact pulse width, no math at all
   q) quit
 """
 
@@ -232,6 +281,10 @@ while True:
         elif choice == "8":
             hand = input("hand (hour/minute)> ").strip().lower()
             point_at_team(hand, input("team name> ").strip())
+        elif choice == "9":
+            hand = input("hand (hour/minute)> ").strip().lower()
+            servo = hour_servo if hand == "hour" else minute_servo
+            set_raw_pulse(servo, int(input("pulse ns> ")))
         elif choice == "q":
             break
     except KeyboardInterrupt:

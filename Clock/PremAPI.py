@@ -2,7 +2,6 @@ import gc
 import time
 import secrets
 import urequests
-import neopixel
 from machine import Pin, PWM
 
 # ---------------------------------------------------------------------------
@@ -10,10 +9,8 @@ from machine import Pin, PWM
 # ---------------------------------------------------------------------------
 PIN_SERVO_HOUR = 4        # servo driving the hour hand, geared 2:1 for a 360-degree sweep
 PIN_SERVO_MINUTE = 5      # servo driving the minute hand, geared 2:1 for a 360-degree sweep
-PIN_NEOPIXEL = 15         # D15 - lights up while showing the PL matchup, off while showing normal time
-NUM_NEOPIXELS = 1         # how many pixels are on that strip/ring
-NEOPIXEL_MATCH_COLOR = (0, 255, 0)   # (R, G, B) color while showing a matchup
-PIN_BUTTON = 34           # D34 on the robo board - button that triggers "show next match" mode
+PIN_LED_MODE = 2          # D2 - lights up while showing the PL matchup, off while showing normal time
+PIN_BUTTON = 32           # D32 - button that triggers "show next match" mode (D34 has no internal pull-up, don't use it here)
 
 # Pulse width (ns) at each end of the servo's own travel (0-180 degrees on
 # the servo itself), which the 2:1 gearing turns into a full 0-360 degree
@@ -21,8 +18,6 @@ PIN_BUTTON = 34           # D34 on the robo board - button that triggers "show n
 # relative to the other.
 SERVO_HOUR_MIN_NS = 500_000
 SERVO_HOUR_MAX_NS = 2_500_000
-SERVO_MINUTE_MIN_NS = 500_000
-SERVO_MINUTE_MAX_NS = 2_500_000
 
 # Calibration: degrees added to the commanded angle to correct for how the
 # horn/gear landed when it was mounted. Set via calibrate_servos() — command
@@ -30,15 +25,42 @@ SERVO_MINUTE_MAX_NS = 2_500_000
 # way, then adjust this value and re-run calibrate_servos() to confirm. If
 # nudging it the "obvious" direction makes it worse, this rig's gearing
 # inverts rotation sense, so flip the sign instead.
-SERVO_HOUR_OFFSET_DEG = 40.0
-SERVO_MINUTE_OFFSET_DEG = 50.0
+# Only used for the hour servo - the minute servo's calibration is the
+# MINUTE_CALIBRATION table below instead.
+SERVO_HOUR_OFFSET_DEG = 315.0
 
 # Calibration: multiplier on the commanded angle to correct a proportional
 # under/over-rotation (e.g. the real gear ratio isn't exactly 2:1). Found by
 # jogging to a known angle (see ServoTest.py) and comparing to the measured
 # result: scale = commanded_degrees / actual_measured_degrees.
-SERVO_HOUR_SCALE = 1.08
-SERVO_MINUTE_SCALE = 1.0
+# Only used for the hour servo - the minute servo's response turned out to be
+# non-linear (see MINUTE_CALIBRATION below), so a single scale number can't
+# describe it and it uses a measured table + interpolation instead.
+SERVO_HOUR_SCALE = 1
+
+# Calibration table for the minute servo: measured (minute-mark, pulse ns)
+# points from raw-pulse probing in ServoTest.py, since it takes progressively
+# more ns per minute as the pulse gets longer - not a straight line. The
+# floor of this servo's pulse range (~300,000ns) lands at minute 13, not
+# minute 0, so minutes 0-13 are unreachable on this lap; they're reached
+# instead by continuing a bit past a full turn, which is why the table goes
+# up to "minute 75" (= minute 15 of the next lap around). Re-measure and
+# update this if the servo/gearing/mounting ever changes.
+MINUTE_CALIBRATION = [
+    (13, 300_000),
+    (15, 390_000),
+    (30, 850_000),
+    (45, 1_450_000),
+    (60, 2_000_000),
+    (75, 2_450_000),
+]
+
+# If the horn/gear ever slips or gets remounted, the whole table above shifts
+# by a fixed amount without changing its shape - correct for that here rather
+# than re-measuring everything. In minutes (1 min = 6 degrees). Positive =
+# hand was sitting clockwise of target, negative = counter-clockwise.
+# e.g. hand sat 90 deg (15 min) counter-clockwise of target -> +15 to correct.
+MINUTE_CALIBRATION_SHIFT_MIN = 15
 
 DEBOUNCE_MS = 200
 MATCH_DISPLAY_SECONDS = 10   # how long to hold the team positions before returning to clock mode
@@ -69,14 +91,11 @@ TEAM_DIAL_OFFSET_DEG = 0.0
 # ---------------------------------------------------------------------------
 hour_servo = PWM(Pin(PIN_SERVO_HOUR), freq=50, duty_u16=0)
 minute_servo = PWM(Pin(PIN_SERVO_MINUTE), freq=50, duty_u16=0)
-mode_pixels = neopixel.NeoPixel(Pin(PIN_NEOPIXEL), NUM_NEOPIXELS)
+led_mode = Pin(PIN_LED_MODE, Pin.OUT, value=0)
 
 
 def set_mode_led(on):
-    color = NEOPIXEL_MATCH_COLOR if on else (0, 0, 0)
-    for i in range(NUM_NEOPIXELS):
-        mode_pixels[i] = color
-    mode_pixels.write()
+    led_mode.value(1 if on else 0)
 
 
 def log(msg):
@@ -98,8 +117,31 @@ def set_hour_position(fraction):
     set_position(hour_servo, fraction, SERVO_HOUR_MIN_NS, SERVO_HOUR_MAX_NS, SERVO_HOUR_OFFSET_DEG, SERVO_HOUR_SCALE, label="Hour")
 
 
+def interpolate_ns(table, x):
+    """Piecewise-linear lookup: find where x falls between two calibrated
+    (x, ns) points and interpolate, instead of assuming one straight line
+    across the whole range like set_position does."""
+    for (x0, ns0), (x1, ns1) in zip(table, table[1:]):
+        if x0 <= x <= x1:
+            t = (x - x0) / (x1 - x0)
+            return ns0 + t * (ns1 - ns0)
+    return table[0][1] if x < table[0][0] else table[-1][1]
+
+
 def set_minute_position(fraction):
-    set_position(minute_servo, fraction, SERVO_MINUTE_MIN_NS, SERVO_MINUTE_MAX_NS, SERVO_MINUTE_OFFSET_DEG, SERVO_MINUTE_SCALE, label="Minute")
+    """Point the minute hand using the measured MINUTE_CALIBRATION table
+    instead of a straight-line formula. Minutes 0-13 fall below this servo's
+    real pulse floor, so they're looked up as "minute + 60" instead - reached
+    by continuing a bit past a full turn rather than a low pulse.
+    MINUTE_CALIBRATION_SHIFT_MIN corrects for the horn/gear's mounting
+    position without needing to re-measure the whole table."""
+    minute = (fraction * 60 + MINUTE_CALIBRATION_SHIFT_MIN) % 60
+    low_minute = MINUTE_CALIBRATION[0][0]
+    if minute < low_minute:
+        minute += 60
+    pulse_ns = int(interpolate_ns(MINUTE_CALIBRATION, minute))
+    minute_servo.duty_ns(pulse_ns)
+    log(f"Minute servo -> target {fraction * 360:.1f} deg ({fraction * 60:.1f} min), pulse {pulse_ns} ns")
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +202,7 @@ def format_date(t):
 # ---------------------------------------------------------------------------
 def get_next_match(now_ts):
     """Return (home_name, away_name) for the next scheduled PL match, or None."""
-    one_week_later = now_ts + (7 * 24 * 60 * 60)
+    one_week_later = now_ts + (21 * 24 * 60 * 60)
     date_from = format_date(time.gmtime(now_ts))
     date_to = format_date(time.gmtime(one_week_later))
     url = f"https://api.football-data.org/v4/competitions/PL/matches?status=SCHEDULED&dateFrom={date_from}&dateTo={date_to}"
@@ -298,8 +340,9 @@ def calibrate_servos():
     Usage: temporarily call this instead of test_clock_hands() in Main below,
     flash it, then measure each hand against the 12 o'clock mark:
       - How many degrees off is it, and which way (clockwise/counter-clockwise)?
-    Report those two numbers and I'll set SERVO_HOUR_OFFSET_DEG /
-    SERVO_MINUTE_OFFSET_DEG for you. Ctrl+C out of this once you've measured.
+    Report those two numbers and I'll set SERVO_HOUR_OFFSET_DEG (for the hour
+    hand) or the first MINUTE_CALIBRATION point (for the minute hand). Ctrl+C
+    out of this once you've measured.
     """
     log("CALIBRATION: parking hour + minute hands at fraction 0.0 (true 12 o'clock)")
     set_hour_position(0.0)
@@ -327,6 +370,15 @@ def probe_servo_range(servo, label, start_ns=300_000, end_ns=2_700_000, step_ns=
         time.sleep(step_seconds)
         ns += step_ns
 
+def wait_or_button(seconds):
+    """Sleep up to `seconds`, but return early the moment the button sets
+    match_requested - so a press is noticed within ~50ms instead of waiting
+    out the rest of a long clock-update sleep."""
+    end = time.ticks_add(time.ticks_ms(), int(seconds * 1000))
+    while time.ticks_diff(end, time.ticks_ms()) > 0:
+        if match_requested:
+            return
+        time.sleep_ms(50)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -358,5 +410,5 @@ while True:
         show_next_match(current_time())
     else:
         show_clock(current_time())
-        time.sleep(CLOCK_UPDATE_SECONDS)
+        wait_or_button(CLOCK_UPDATE_SECONDS)
 
