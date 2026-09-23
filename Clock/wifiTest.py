@@ -1,4 +1,4 @@
-import connect_wifi
+import Clock.connect_wifi as connect_wifi
  
  #ON REPL you can type wlan.isconnected() hit ENTER. it will return True
 
