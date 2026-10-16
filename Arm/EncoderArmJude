@@ -1,0 +1,41 @@
+import encoder
+import time
+
+from machine import Pin, PWM
+
+max_duty = 65535
+
+# Servo
+pwm1 = PWM(Pin(5), freq=50)
+pwm2 = PWM(Pin(4), freq=50)
+
+# Encoder
+enc1 = encoder.Count(32, 39)
+enc2 = encoder.Count(25, 33)
+
+last1 = enc1.value()
+last2 = enc2.value()
+count1 = 0
+count2 = 0
+
+while True:
+
+    value1 = enc1.value()
+    value2 = enc2.value()
+
+    # Add movement since last loop, but stay between 0 and 2000
+    count1 = max(0, min(2000, count1 + value1 - last1))
+    count2 = max(0, min(1500, count2 + value2 - last2))
+    last1 = value1
+    last2 = value2
+
+    print("Encoder:", count1, count2)
+
+    # Convert count to 0.5–2.5 ms servo pulse
+    pwm_range1 = 0.5 + count1 / 2000 * 2.0
+    pwm_range2 = 0.5 + count2 / 2000 * 2.0
+
+    pwm1.duty_u16(int(pwm_range1 * max_duty / 20))
+    pwm2.duty_u16(int(pwm_range2 * max_duty / 20))
+
+    time.sleep(0.05)
