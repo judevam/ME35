@@ -10,13 +10,13 @@ import veml6040
 # 2) In the main program: scanner = ColorScanner(), then call scanner.scan() in the loop.
 
 # one entry per record + "empty" (what the sensor sees with nothing in front of it)
-LABELS = ["empty", "red", "blue", "green"]
+LABELS = ["empty", "yellow", "blue", "green"]
 
 # which playlist each record starts -- copy the ID from Spotify: playlist -> Share -> Copy link
 PLAYLISTS = {
-    "red":   "spotify:playlist:PASTE_ID_HERE",   # dance
-    "blue":  "spotify:playlist:PASTE_ID_HERE",   # chill
-    "green": "spotify:playlist:PASTE_ID_HERE",   # study
+    "yellow":   "spotify:playlist:3ok1l9Nwnlp69cvqVSUOT5",   # sunny
+    "blue":  "spotify:playlist:4VCq8Q3RwOhogaCX72qVsW",   # jazz
+    "green": "spotify:playlist:3bwVvRCjxaif9uXtvMfnw2",   # dance
 }
 
 SAMPLES_PER_LABEL = 10   # training readings per record

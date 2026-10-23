@@ -6,17 +6,26 @@ import gc
 import urequests as requests
 
 
-WIFI_SSID = secrets.Home
-WIFI_PASS = secrets.HomePWD
+WIFI_SSID = secrets.RobotUser
+WIFI_PASS = secrets.RobotPwd
 
 
 def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
+    if wlan.isconnected():
+        print("Connected:", wlan.ifconfig())
+        return
+    # reset the radio -- after a soft reboot it can be stuck mid-connect
+    # ("Wifi Internal State Error")
+    wlan.active(False)
+    time.sleep(0.5)
     wlan.active(True)
-    if not wlan.isconnected():
-        wlan.connect(WIFI_SSID, WIFI_PASS)
-        while not wlan.isconnected():
-            time.sleep(0.5)
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    start = time.time()
+    while not wlan.isconnected():
+        if time.time() - start > 15:
+            raise OSError("WiFi timed out -- check SSID/password in secrets.py")
+        time.sleep(0.5)
     print("Connected:", wlan.ifconfig())
 
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -53,7 +62,16 @@ def spotify(method, path, body=None):
             data = json.dumps(body)
             headers["Content-Type"] = "application/json"
 
-        r = requests.request(method, API_URL + path, data=data, headers=headers)
+        try:
+            r = requests.request(method, API_URL + path, data=data, headers=headers)
+        except OSError as e:
+            # network blip (e.g. Errno 118 host unreachable) -- reconnect and retry once
+            if attempt == 1:
+                raise
+            print("Network error, reconnecting:", e)
+            time.sleep(1)
+            connect_wifi()
+            continue
         status = r.status_code
         result = None
         if status == 200 and method == "GET":

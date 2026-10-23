@@ -1,4 +1,4 @@
-from machine import Pin, PWM
+from machine import Pin, PWM, freq
 import neopixel
 import time
 
@@ -8,27 +8,33 @@ from joystick import Joystick
 from colorScanner import ColorScanner, PLAYLISTS
 from accelerometer import Accel
 
-# ---------------- PINS (change to match your wiring) ----------------
+freq(240000000)   # full CPU speed -- makes each HTTPS handshake faster
+
+# ---------------- PINS (Cytron Robo ESP32) ----------------
+# joystick = 33 (X), 32 (Y) -> set in joystick.py
+# color sensor = SDA 21, SCL 22 -> set in colorScanner.py
+# motor encoder = 36, 39 -> not used yet (the turntable just spins)
 SERVO_PIN = 4
-MOTOR_PIN_A = 18      # DC motor driver input 1 (speed)
-MOTOR_PIN_B = 19      # DC motor driver input 2 (kept low = one direction)
-NEOPIXEL_PIN = 15
+MOTOR_PIN_A = 12      # motor speed (PWM)
+MOTOR_PIN_B = 13      # kept low = one direction -- swap A and B if it spins the wrong way
+NEOPIXEL_PIN = 15     # the board's 2 built-in RGB LEDs (same as your earlier projects)
 NUM_PIXELS = 2
-BUZZER_PIN = 23
+BUZZER_PIN = 23       # built-in buzzer
 
 # ---------------- SETTINGS ----------------
 MOTOR_SPEED = 30000          # 0-65535, how fast the turntable spins
-HEAD_UP = 90                 # servo angle at the top of a bob
-HEAD_DOWN = 70               # servo angle at the bottom of a bob
-HEAD_REST = 60               # head drooped when paused
+HEAD_UP = 75                 # servo angle at the top of a bob
+HEAD_DOWN = 44               # servo angle at the bottom of a bob
+HEAD_REST = 70               # head drooped when paused
 VOLUME_STEP = 10
-POLL_MS = 5000               # how often to ask Spotify what's playing
+POLL_MS = 8000               # how often to ask Spotify what's playing
+VOLUME_DELAY = 400           # wait for the stick to settle, then send one volume change
 SCAN_MS = 200                # how often to check the color sensor
 DEFAULT_BPM = 100
 
 # light color + default BPM for each record (until the BPM API is added)
-RECORD_RGB = {"red": (60, 0, 0), "blue": (0, 0, 60), "green": (0, 60, 0)}
-RECORD_BPM = {"red": 125, "blue": 85, "green": 100}
+RECORD_RGB = {"yellow": (50, 35, 0), "blue": (0, 0, 60), "green": (0, 60, 0)}
+RECORD_BPM = {"yellow": 110, "blue": 85, "green": 125}
 
 # ---------------- OUTPUTS ----------------
 servo = PWM(Pin(SERVO_PIN), freq=50)
@@ -66,6 +72,16 @@ def flash(rgb, ms=150):
     time.sleep_ms(ms)
 
 
+def show_state(on):
+    # motor + lights for playing/paused -- called before API calls so the pet reacts instantly
+    set_motor(on)
+    if on:
+        set_lights(RECORD_RGB.get(record, (30, 0, 30)))
+    else:
+        set_lights((3, 3, 3))                   # dim when paused
+        set_head(HEAD_REST)
+
+
 def safe(fn, *args):
     # run a Spotify call without crashing the pet if WiFi hiccups
     try:
@@ -79,6 +95,8 @@ def safe(fn, *args):
 def check_gesture(acc):
     # returns "skip" (shake no), "like" (nod yes) or None
     # TODO: fill in once we've looked at your nod/shake/tilt readings
+    if acc is None:
+        return None
     x, y, z = acc.read()
     return None
 
@@ -92,7 +110,11 @@ refresh_token()
 
 js = Joystick()
 scanner = ColorScanner()
-acc = Accel()
+try:
+    acc = Accel()
+except OSError:
+    acc = None            # not plugged in -- run without gestures
+    print("No accelerometer found, skipping gestures")
 
 volume = safe(get_volume) or 50
 playing = False
@@ -103,6 +125,7 @@ head_is_up = False
 next_bob = 0
 next_poll = 0
 next_scan = 0
+volume_send_at = None      # when to send the pending volume change (None = nothing pending)
 
 beep(1500, 80)
 beep(2000, 80)
@@ -116,10 +139,10 @@ while True:
     e = js.get_event()
     if e == "up":
         volume = min(100, volume + VOLUME_STEP)
-        safe(set_volume, volume)
+        volume_send_at = time.ticks_add(now, VOLUME_DELAY)
     elif e == "down":
         volume = max(0, volume - VOLUME_STEP)
-        safe(set_volume, volume)
+        volume_send_at = time.ticks_add(now, VOLUME_DELAY)
     elif e == "right":
         flash((40, 40, 40))
         safe(next_song)
@@ -129,13 +152,19 @@ while True:
         safe(prev_song)
         next_poll = time.ticks_add(now, 1000)
     elif e == "press":
-        if playing:
-            safe(pause)
-            playing = False
-        else:
-            safe(play)
-            playing = True
+        playing = not playing
+        show_state(playing)                     # react now, Spotify catches up
         beep(1200, 60)
+        safe(play if playing else pause)
+
+    if e in ("up", "down", "press"):
+        # don't let a status check block the stick right after you use it
+        next_poll = time.ticks_add(now, POLL_MS)
+
+    # --- send the volume once the stick has settled ---
+    if volume_send_at is not None and time.ticks_diff(now, volume_send_at) >= 0:
+        volume_send_at = None
+        safe(set_volume, volume)
 
     # --- color scanner (only while paused) ---
     if not playing and time.ticks_diff(now, next_scan) >= 0:
@@ -147,8 +176,9 @@ while True:
             bpm = RECORD_BPM.get(color, DEFAULT_BPM)
             set_head(HEAD_UP)                   # head lifts up
             beep(1800, 100)
-            safe(play_playlist, PLAYLISTS[color])
             playing = True
+            show_state(True)
+            safe(play_playlist, PLAYLISTS[color])
             next_poll = time.ticks_add(now, 1500)
 
     # --- accelerometer gestures ---
@@ -163,29 +193,29 @@ while True:
     # --- ask Spotify what's playing (also catches pausing from the laptop) ---
     if time.ticks_diff(now, next_poll) >= 0:
         next_poll = time.ticks_add(now, POLL_MS)
-        info = safe(now_playing)
-        if info:
-            song, artist, image_url, uri, is_playing = info
-            playing = is_playing
-            if uri != track_uri:
-                track_uri = uri
-                print("Now playing:", song, "-", artist)
-                # TODO: look up this song's BPM (ReccoBeats) and set bpm here
-        else:
-            playing = False
+        try:
+            info = now_playing()
+            if info:
+                song, artist, image_url, uri, is_playing = info
+                playing = is_playing
+                if uri != track_uri:
+                    track_uri = uri
+                    print("Now playing:", song, "-", artist)
+                    # TODO: look up this song's BPM (ReccoBeats) and set bpm here
+            else:
+                playing = False
+        except Exception as e:
+            # keep the last state so the motor doesn't stutter on a WiFi blip
+            print("API error:", e)
 
     # --- outputs ---
-    set_motor(playing)
+    show_state(playing)
     if playing:
-        set_lights(RECORD_RGB.get(record, (30, 0, 30)))
         # head-bob to the beat: up and down once per beat
         if time.ticks_diff(now, next_bob) >= 0:
             head_is_up = not head_is_up
             set_head(HEAD_UP if head_is_up else HEAD_DOWN)
             half_beat = int(60000 / bpm / 2)
             next_bob = time.ticks_add(now, half_beat)
-    else:
-        set_lights((3, 3, 3))                   # dim when paused
-        set_head(HEAD_REST)
 
     time.sleep_ms(20)
