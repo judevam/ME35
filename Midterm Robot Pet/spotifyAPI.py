@@ -100,7 +100,7 @@ def like_song(track_uri):
 
 
 def now_playing():
-    # returns (song, artist, image_url, track_uri) or None if nothing is playing
+    # returns (song, artist, image_url, track_uri, is_playing) or None if nothing is loaded
     status, data = spotify("GET", "/me/player/currently-playing")
     if status != 200 or data is None or data.get("item") is None:
         return None
@@ -110,9 +110,18 @@ def now_playing():
     images = item["album"]["images"]
     image_url = images[-1]["url"] if images else None  # smallest image
     track_uri = item["uri"]
+    is_playing = data.get("is_playing", False)  # False when paused
     data = None
     gc.collect()
-    return song, artist, image_url, track_uri
+    return song, artist, image_url, track_uri, is_playing
+
+
+def get_volume():
+    # current Spotify volume 0-100, or None if no active device
+    status, data = spotify("GET", "/me/player")
+    if status != 200 or data is None or data.get("device") is None:
+        return None
+    return data["device"].get("volume_percent")
 
 
 # quick test: run this file on the ESP32 with Spotify playing on your laptop

@@ -39,31 +39,55 @@ playlists without leaving what I'm working on. Lights show the mood of the curre
 ### Inputs -> actions -> reactions
 | Input | Action | Pet reaction |
 |---|---|---|
-| Shake head "no" (accelerometer on headphones) | Skip song | Servo head turns away, red flash, short "blegh" buzz |
-| Nod head "yes" | Like song (save to Liked Songs) | Happy head bob, sparkle lights |
+| Shake head "no" (accelerometer on headphones) | Skip song | Head stops bobbing and drops down, red flash, short "blegh" buzz |
+| Nod head "yes" | Happy head bob, sparkle lights |
 | Joystick up/down | Volume +/- | Neopixels fill like a volume meter |
-| Joystick left/right | Previous / next track | Head tilt toward that side |
+| Joystick left/right | Previous / next track | Quick light sweep left/right, head pauses then restarts bobbing at the new song's BPM |
 | Joystick press | Play / pause | DC motor turntable stops / starts spinning |
-| Color card on color sensor | Start playlist (red = hype, blue = chill, green = study, ...) | Head tilts curiously, lights switch to card color, record spins up |
+| Scan a colored record on the color sensor (only while paused) | Start that record's playlist (red = dance, blue = chill, green = study, ...) | Head lifts up, lights switch to record color, turntable spins up, head starts bobbing to the beat |
 
-Two distinct responses: shake vs. nod (accelerometer), and different color cards (color sensor).
+Two distinct responses: shake vs. nod (accelerometer), and different colored records (color sensor).
 
 ### Outputs
-- **Servo:** head (bob, turn away, tilt)
-- **DC motor:** spinning record/turntable on its back while music plays
+- **Servo:** head can only move forward/back (motor placement), so it **head-bobs to the beat** of
+  the current song while music plays, and holds still (head down) when paused
+  - BPM comes from a separate API (Spotify's tempo/audio-features endpoint is deprecated):
+    try ReccoBeats (free, no key, looks up by Spotify track ID) or GetSongBPM
+  - Fallback if a song isn't found: a default BPM per playlist/record (e.g. dance = 125, chill = 85)
+  - Bob timing: one bob per beat = 60 / BPM seconds; use time.ticks_ms() so the bob doesn't block
+    the joystick/accelerometer/scanner code
+  - Tempo only, not exact beat timing -- it will be on tempo but may be slightly off the downbeat
+- **DC motor:** spins the turntable whenever a song is playing, stops when paused
 - **Neopixels:** album-art color (song mood), volume meter, gesture feedback flashes
 - **Buzzer:** very short reaction sounds only (don't play over the music)
+
+### Turntable + record scanner
+- **Turntable:** the DC motor spins a table whenever a song is playing and stops when paused.
+  No sensor on it -- it's for show / personality.
+- **Scanner:** a separate color sensor on the pet. Each "record" is a disk with a solid color
+  (or colored label) -- one color per playlist.
+- **Scanning only works at specific times** (when the music is paused / nothing is playing).
+  While a song is playing, the scanner is ignored.
+- Flow: **paused -> user scans a record -> KNN picks the color -> that playlist starts -> turntable starts spinning.**
+- Add an **"empty"** class to the KNN (what the sensor sees with nothing in front of it) so it only
+  reacts when a record is actually held up.
+- Only accept a color after several matching readings in a row, so waving the record past doesn't
+  pick the wrong playlist.
+- Keep the sensor-to-record distance fixed (a small cradle/slot to hold the record against) and block
+  outside light -- retrain the KNN in the final enclosure.
 
 ### Architecture
 ```
 Headphones: accelerometer --(wire, I2C)--> ESP32 in pet
-Pet ESP32 (MicroPython) --WiFi HTTP--> Laptop Python server (spotipy) --> Spotify Web API
-                        <-- song info + album-art dominant color --
+Pet ESP32 (MicroPython) --WiFi HTTPS--> Spotify Web API   (spotifyAPI.py -- working!)
 ```
-- Laptop server handles Spotify OAuth (too painful on the ESP32) and computes the album cover's
-  dominant color (Spotify's audio-features/mood endpoint is deprecated for new apps).
+- Login (OAuth) was done once by hand; the ESP32 uses the saved refresh token in secrets.py
+  to get new access tokens on its own.
 - Pet reacts locally right away (lights/servo), then sends the command -- hides WiFi lag.
 - Spotify endpoints: next, previous, play/pause, volume, save track, start playlist, currently playing.
+- BPM: when the song changes, look up the track ID's tempo (ReccoBeats/GetSongBPM) and set the head-bob speed.
+- Song-mood lights: Spotify's audio-features endpoint is deprecated, so lights follow the record's
+  color (album-art color would need a laptop helper -- optional stretch).
 
 ### Gesture detection notes
 - **Nod** (pitch) is easy: gravity shifts between axes -> look for down-then-up past a threshold.
@@ -77,19 +101,19 @@ Pet ESP32 (MicroPython) --WiFi HTTP--> Laptop Python server (spotipy) --> Spotif
 
 ### Class topics to justify
 - **APIs / WiFi client-server** (Spotify Web API + laptop bridge, builds on Clock project)
-- **KNN color classification** for the playlist cards (reuse demo_color_KNN.py / veml6040.py from Color Sensor Sorter)
-- **CAD / Onshape** for the pet body and turntable (digital twin optional: mirror head angle)
+- **KNN color classification** for the playlist records (reuse demo_color_KNN.py / veml6040.py from Color Sensor Sorter)
+- **CAD / Onshape** for the pet body, turntable, scanner, and records (digital twin optional: mirror head-bob angle)
 
 ### Parts
 - ESP32, accelerometer, joystick, color sensor (VEML6040), 1 servo, 1 DC motor (+ driver), Neopixels, buzzer
-- Colored cards (one per playlist), 3D-printed / cardboard body, headphone clip for the accelerometer
+- Colored records (one per playlist, 3D-printed or cardboard disks), turntable platter, scanner cradle for the color sensor, 3D-printed / cardboard body, headphone clip for the accelerometer
 
 ### Build order (de-risk first)
-1. Laptop server: spotipy auth + endpoints working from a test script
-2. ESP32 -> server over WiFi (reuse Clock code): joystick volume/skip
-3. Color cards + KNN -> playlists
+1. ~~Spotify auth + API calls from the ESP32~~ (done -- spotifyAPI.py)
+2. Joystick -> volume / prev / next / play-pause
+3. Scanner: color sensor + records + KNN (incl. "empty") -> playlists (only while paused); turntable spins while playing
 4. Accelerometer gestures (log raw data while nodding/shaking, tune thresholds)
-5. Personality: servo animations, turntable, album-color lights, sounds
+5. Personality: head-bob to BPM (test the BPM API first), turntable, lights, sounds
 6. Body CAD, assembly, video, portfolio
 
 ### Open questions
