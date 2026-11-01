@@ -6,8 +6,8 @@ import gc
 import urequests as requests
 
 
-WIFI_SSID = secrets.RobotUser
-WIFI_PASS = secrets.RobotPwd
+WIFI_SSID = secrets.Home
+WIFI_PASS = secrets.HomePWD
 
 
 def connect_wifi():

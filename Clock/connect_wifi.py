@@ -6,8 +6,8 @@ import secrets
  
 #setting up SSID and password 
  
-SSID = secrets.SSID #use tufts_eecs
-PASSWORD = secrets.PWD #foundedin1883
+SSID = secrets.Home #use tufts_eecs
+PASSWORD = secrets.HomePWD #foundedin1883
 
 
 #function definition 
