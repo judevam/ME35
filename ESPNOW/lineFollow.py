@@ -1,5 +1,6 @@
 from colorLineCalibrate import LineSensors
 import time
+import json
 from machine import Pin
 from machine import PWM
 import neopixel
@@ -70,31 +71,94 @@ def set_lights(rgb):
     pixels.write()
 
 
-def start_beep(freq):
-    # starts the tone and notes when to stop; the main loop turns it off, so driving never pauses
-    global beep_end
-    buzzer.freq(freq)
-    buzzer.duty_u16(BEEP_DUTY)
-    beep_end = time.ticks_add(time.ticks_ms(), BEEP_MS)
+# ---- melodies: a note player that never blocks the steering ----
+# notes in Hz. A melody is a list of (note, beats); 0 = a rest. play_melody() queues it up and
+# update_melody() (called every pass of the main loop) switches the buzzer from note to note.
+C4, D4, E4, F4, G4, A4, B4 = 262, 294, 330, 349, 392, 440, 494
+C5, D5, E5, F5, G5, A5, B5 = 523, 587, 659, 698, 784, 880, 988
+C6 = 1047
+REST = 0
+NOTE_GAP = 25            # ms of silence after each note so repeated notes are heard separately
+
+melody = []              # the steps being played: (freq, ms)
+melody_i = 0
+melody_next = 0          # when to move on to the next step
+
+def play_melody(notes, beat_ms):
+    # start a melody now (replaces one that is still playing)
+    global melody, melody_i, melody_next
+    steps = []
+    for freq, beats in notes:
+        ms = int(beats * beat_ms)
+        if freq:
+            steps.append((freq, ms - NOTE_GAP))
+            steps.append((0, NOTE_GAP))
+        else:
+            steps.append((0, ms))
+    melody = steps
+    melody_i = 0
+    melody_next = time.ticks_ms()
+    buzzer.duty_u16(0)
+
+def update_melody(now):
+    # call every loop: moves to the next note when the current one is done
+    global melody, melody_i, melody_next
+    if not melody or time.ticks_diff(now, melody_next) < 0:
+        return
+    if melody_i >= len(melody):
+        buzzer.duty_u16(0)
+        melody = []
+        return
+    freq, ms = melody[melody_i]
+    melody_i += 1
+    if freq:
+        buzzer.freq(freq)
+        buzzer.duty_u16(BEEP_DUTY)
+    else:
+        buzzer.duty_u16(0)
+    melody_next = time.ticks_add(now, ms)
 
 
-# one function per color -- called once when that marker is detected.
-# TODO: write a pattern for each (for now each is one beep at its own pitch)
+# --- red: La Cucaracha ("La cu-ca-ra-cha, la cu-ca-ra-cha, ya no pue-de ca-mi-nar") ---
+LA_CUCARACHA = [
+    (C4, 1), (C4, 1), (C4, 1), (F4, 3), (A4, 2), (REST, 1),
+    (C4, 1), (C4, 1), (C4, 1), (F4, 3), (A4, 2), (REST, 1),
+    (F4, 1), (F4, 1), (E4, 1), (E4, 1), (D4, 1), (D4, 1), (C4, 4),
+]
+
+# --- blue: William Tell Overture finale -- the galloping "da da DUM" fanfare ---
+# NOTE: the rhythm is the gallop, but I wrote the pitches from memory and could not check them
+# against a score -- if it doesn't sound right, fix the notes here.
+WILLIAM_TELL = [
+    (G4, 1), (G4, 1), (G4, 2), (G4, 1), (G4, 1), (G4, 2),
+    (C5, 1), (C5, 1), (C5, 2), (C5, 1), (C5, 1), (E5, 2),
+    (G5, 1), (E5, 1), (C5, 3),
+]
+
+# --- green: Ride of the Valkyries -- the repeated-note heroic call ---
+# NOTE: same warning as above: from memory, not checked against a score. Edit the notes to taste.
+VALKYRIES = [
+    (E5, 2), (E5, 1), (E5, 1), (A5, 3), (REST, 1),
+    (E5, 2), (E5, 1), (E5, 1), (A5, 3), (REST, 1),
+    (C6, 2), (A5, 1), (E5, 1), (A5, 4),
+]
+
+# one function per color -- called once when that marker is detected
 def beepRed():
-    start_beep(BEEP_FREQS["red"])
+    play_melody(LA_CUCARACHA, 120)
 
 def beepGreen():
-    start_beep(BEEP_FREQS["green"])
+    play_melody(VALKYRIES, 110)
 
 def beepBlue():
-    start_beep(BEEP_FREQS["blue"])
+    play_melody(WILLIAM_TELL, 90)
 
 BEEP_FUNCS = {"red": beepRed, "green": beepGreen, "blue": beepBlue}
 
 
 
 # add p controller
-base = 20
+base = 30
 Kp = 125
 # left - right when the robot is in the ideal spot (left on white, right on black).
 target = 0.38
@@ -137,9 +201,7 @@ last_error = 0           # last error seen on the line: decides which way to sea
 SLOW_FACTOR = 40         # speed lost per 1.0 of |error| -- raise to slow down more in turns
 MIN_BASE = 12            # never slow below this (motors stall at very low speeds)
 
-# color markers on the line: each color calls its own beep function (beepRed, beepGreen, beepBlue)
-BEEP_FREQS = {"red": 800, "green": 1200, "blue": 1600}   # each color always makes its own pitch
-BEEP_MS = 200            # how long each beep lasts
+# color markers on the line: each color plays its own melody (beepRed, beepGreen, beepBlue)
 BEEP_DUTY = 2000         # buzzer volume (same as DJude)
 MARKER_COLORS = ["red", "green", "blue"]
 STABLE_COUNT = 3         # same marker this many color checks in a row before it counts
@@ -152,11 +214,43 @@ next_print = 0
 LOG = True               # True = print one compact line per steering step, to paste back for analysis
                          # columns: ms, left, right, error, d_term, L speed, R speed  (or LOST)
 MARKER_COOLDOWN = 1000   # ms before the SAME color can beep again, so one marker beeps once
-beep_end = None         # when the current beep should stop (None = not beeping)
 last_beep_color = None   # color of the last beep
 seen_color = None
 seen_reads = 0
 last_beep = time.ticks_add(time.ticks_ms(), -MARKER_COOLDOWN)   # so the first marker can beep
+
+# ---- ESP-NOW: tell another ESP which marker we just saw ----
+# Everything here is set up ONCE, before the robot starts, and a send is one quick call in the
+# marker branch (once per marker, because of MARKER_COOLDOWN) -- never every loop.
+ESPNOW_ENABLED = True
+PEER_MAC = bytes([0x20, 0x50, 0x0d, 0x2a, 0xff, 0xbc])     # the OTHER board's MAC (from macAddress.py), as 6 bytes
+                         # (run macAddress.py on that board). None = ESP-NOW stays off.
+# same message format as getPartner.py, so a receiver written for it will light its LED
+MARKER_MESSAGES = {c: json.dumps({"state": "color", "payload": list(COLOR_RGB[c])}) for c in COLOR_RGB}
+espnow_link = None
+
+if ESPNOW_ENABLED and PEER_MAC is not None:
+    try:
+        import network
+        import espnow
+        sta = network.WLAN(network.WLAN.IF_STA)
+        sta.active(True)
+        sta.disconnect()
+        espnow_link = espnow.ESPNow()
+        espnow_link.active(True)
+        espnow_link.add_peer(PEER_MAC)
+    except Exception as err:            # a radio problem must never stop the robot
+        print("ESP-NOW unavailable:", err)
+        espnow_link = None
+
+def send_marker(color):
+    # fire and forget: sync=False returns right away instead of waiting for the other board's ACK
+    if espnow_link is None:
+        return
+    try:
+        espnow_link.send(PEER_MAC, MARKER_MESSAGES[color], False)
+    except OSError as err:
+        print("ESP-NOW send failed:", err)
 
 # start button: the robot waits here until D34 is pressed
 START_PIN = 34           # D34 (input only -- the board has no internal pull-up for it)
@@ -181,10 +275,8 @@ try:
             print("Stopped by D35")
             break
 
-        # --- stop the beep once its time is up (doesn't block the driving) ---
-        if beep_end is not None and time.ticks_diff(now, beep_end) >= 0:
-            buzzer.duty_u16(0)
-            beep_end = None
+        # --- keep the current melody going (doesn't block the driving) ---
+        update_melody(now)
 
         # --- steer only once per CONTROL_MS, about how often the sensors give a new reading.
         # The wheels keep their last speeds in between. A faster loop just re-reads the same value,
@@ -216,6 +308,7 @@ try:
         if seen_reads == STABLE_COUNT and cooled_down:
             print("marker:", seen_color)
             BEEP_FUNCS[seen_color]()
+            send_marker(seen_color)
             last_beep = now
             last_beep_color = seen_color
 
