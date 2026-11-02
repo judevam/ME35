@@ -158,7 +158,7 @@ BEEP_FUNCS = {"red": beepRed, "green": beepGreen, "blue": beepBlue}
 
 
 # add p controller
-base = 30
+base = 40
 Kp = 125
 # left - right when the robot is in the ideal spot (left on white, right on black).
 target = 0.38
@@ -198,7 +198,7 @@ lost_since = None
 last_error = 0           # last error seen on the line: decides which way to search when lost
 
 # slow down in turns: forward speed drops as the error grows
-SLOW_FACTOR = 40         # speed lost per 1.0 of |error| -- raise to slow down more in turns
+SLOW_FACTOR = 50         # speed lost per 1.0 of |error| -- raise to slow down more in turns
 MIN_BASE = 12            # never slow below this (motors stall at very low speeds)
 
 # color markers on the line: each color plays its own melody (beepRed, beepGreen, beepBlue)
@@ -223,7 +223,7 @@ last_beep = time.ticks_add(time.ticks_ms(), -MARKER_COOLDOWN)   # so the first m
 # Everything here is set up ONCE, before the robot starts, and a send is one quick call in the
 # marker branch (once per marker, because of MARKER_COOLDOWN) -- never every loop.
 ESPNOW_ENABLED = True
-PEER_MAC = bytes([0x20, 0x50, 0x0d, 0x2a, 0xff, 0xbc])     # the OTHER board's MAC (from macAddress.py), as 6 bytes
+PEER_MAC = bytes([0x20, 0x50, 0x0d, 0x2b, 0x14, 0x3c])     # the OTHER board's MAC (from macAddress.py), as 6 bytes
                          # (run macAddress.py on that board). None = ESP-NOW stays off.
 # same message format as getPartner.py, so a receiver written for it will light its LED
 MARKER_MESSAGES = {c: json.dumps({"state": "color", "payload": list(COLOR_RGB[c])}) for c in COLOR_RGB}
@@ -260,131 +260,156 @@ start_button = Pin(START_PIN, Pin.IN)
 STOP_PIN = 35            # D35 stops the robot (also input only, no internal pull-up)
 STOP_PRESSED = 0         # value the pin reads when pressed (0 for a button to ground)
 stop_button = Pin(STOP_PIN, Pin.IN)
-print("Ready -- press D34 to start line following")
-while start_button.value() != START_PRESSED:
-    time.sleep_ms(10)
-time.sleep_ms(300)       # let the button settle so one press doesn't count twice
-print("Go!")
+first_run = True
+while True:
+    # wait here until D34 is pressed (after a stop, D35 starts it again too)
+    while stop_button.value() == STOP_PRESSED:      # let go of D35 first, it was just used to stop
+        time.sleep_ms(10)
+    if first_run:
+        print("Ready -- press D34 to start line following")
+    else:
+        print("Stopped -- press D35 or D34 to run again")
+    while not (start_button.value() == START_PRESSED
+               or (not first_run and stop_button.value() == STOP_PRESSED)):
+        time.sleep_ms(10)
+    first_run = False
+    time.sleep_ms(300)       # let the button settle so one press doesn't count twice
+    while stop_button.value() == STOP_PRESSED:      # a D35 press that started the run must not stop it
+        time.sleep_ms(10)
+    print("Go!")
 
-try:
-    while True:
-        now = time.ticks_ms()
+    # fresh state for every run
+    white_steps = 0
+    stuck_steps = 0
+    lost_since = None
+    last_error = 0
+    skip_d = True
+    next_control = 0
+    seen_color = None
+    seen_reads = 0
+    tape_side = "right"
 
-        # --- D35 stops the robot (the finally block below stops the motors) ---
-        if stop_button.value() == STOP_PRESSED:
-            print("Stopped by D35")
-            break
+    try:
+        while True:
+            now = time.ticks_ms()
 
-        # --- keep the current melody going (doesn't block the driving) ---
-        update_melody(now)
-
-        # --- steer only once per CONTROL_MS, about how often the sensors give a new reading.
-        # The wheels keep their last speeds in between. A faster loop just re-reads the same value,
-        # which made the derivative 0 most loops and then one big spike.
-        if time.ticks_diff(now, next_control) < 0:
-            continue
-        next_control = time.ticks_add(now, CONTROL_MS)
-
-        left = scaled(sensors.left)
-        right = scaled(sensors.right)
-
-        # --- color markers: right sensor only (it's the one on the tape).
-        # color(fresh=False) reuses the reading scaled() just took -- no extra I2C read.
-        color = sensors.right.color(fresh=False)
-        if color not in MARKER_COLORS:
-            color = None
-        if color is not None and color == seen_color:
-            seen_reads += 1
-        else:
-            seen_color = color
-            seen_reads = 1 if color is not None else 0
-        # lights show the last marker color seen, and stay on until a different marker is seen
-        if seen_reads == STABLE_COUNT:
-            set_lights(COLOR_RGB[seen_color])
-
-        # a different color can beep right away; the same color waits out the cooldown
-        cooled_down = (seen_color != last_beep_color
-                       or time.ticks_diff(now, last_beep) >= MARKER_COOLDOWN)
-        if seen_reads == STABLE_COUNT and cooled_down:
-            print("marker:", seen_color)
-            BEEP_FUNCS[seen_color]()
-            send_marker(seen_color)
-            last_beep = now
-            last_beep_color = seen_color
-
-        if left < LEFT_WHITE - LEFT_MARGIN:
-            tape_side = "left"
-        elif right < RIGHT_DARK:
-            tape_side = "right"
-        both_white = left > LOST_LEFT and right > LOST_RIGHT
-        if both_white:
-            white_steps += 1
-        else:
-            white_steps = 0
-        if white_steps >= LOST_STEPS:
-            if lost_since is None:
-                lost_since = time.ticks_ms()
-            if time.ticks_diff(time.ticks_ms(), lost_since) > LOST_TIMEOUT:
-                print("Lost the line, stopping")
+            # --- D35 stops the robot (the finally block below stops the motors) ---
+            if stop_button.value() == STOP_PRESSED:
+                print("Stopped by D35")
                 break
-            skip_d = True               # the first derivative after finding the line would be stale
-            if LOG:
-                print(now, round(left, 2), round(right, 2), "LOST")
-            if tape_side == "left":
-                # the tape was last under the left sensor -- pivot left: right wheel drives
-                print("lost -- searching left")
-                RightMotor.drive(LOST_SPEED, 1)
-                LeftMotor.stop()
+
+            # --- keep the current melody going (doesn't block the driving) ---
+            update_melody(now)
+
+            # --- steer only once per CONTROL_MS, about how often the sensors give a new reading.
+            # The wheels keep their last speeds in between. A faster loop just re-reads the same value,
+            # which made the derivative 0 most loops and then one big spike.
+            if time.ticks_diff(now, next_control) < 0:
+                continue
+            next_control = time.ticks_add(now, CONTROL_MS)
+
+            left = scaled(sensors.left)
+            right = scaled(sensors.right)
+
+            # --- color markers: right sensor only (it's the one on the tape).
+            # color(fresh=False) reuses the reading scaled() just took -- no extra I2C read.
+            color = sensors.right.color(fresh=False)
+            if color not in MARKER_COLORS:
+                color = None
+            if color is not None and color == seen_color:
+                seen_reads += 1
             else:
-                # the tape was last under the right sensor -- pivot right: left wheel drives
-                print("lost -- searching right")
-                LeftMotor.drive(LOST_SPEED, 0)
-                RightMotor.stop()
-            continue
-        lost_since = None
+                seen_color = color
+                seen_reads = 1 if color is not None else 0
+            # lights show the last marker color seen, and stay on until a different marker is seen
+            if seen_reads == STABLE_COUNT:
+                set_lights(COLOR_RGB[seen_color])
 
-        left_dark = max(0, LEFT_WHITE - left - LEFT_MARGIN)
-        edge_error = (LEFT_WHITE - right) - target       # positive = right sensor too far onto the tape
-        if left_dark > 0:
-            error = CORNER_GAIN * left_dark + max(0, edge_error)   # tape under the left sensor: turn left
-        elif both_white and tape_side == "left":
-            error = abs(edge_error)                                # tape is on the left: turn left
-        else:
-            error = edge_error
-        if abs(error) > STUCK_ERROR and error * last_error > 0:
-            stuck_steps += 1
-        else:
-            stuck_steps = 0
-        if stuck_steps >= STUCK_STEPS:
-            print("Turning one way without finding the line, stopping")
-            break
-        if skip_d:
-            last_error = error          # first step, or just found the line: no derivative kick
-            skip_d = False
-        derivative = error - last_error
-        last_error = error
-        d_term = clamp(Kd * derivative, -MAX_D_TERM, MAX_D_TERM)
-        correction = (Kp * error) + d_term
-        forward = max(MIN_BASE, base - SLOW_FACTOR * abs(error))
-        left_speed = clamp(forward - correction, -100, 100)    # negative = wheel reverses
-        right_speed = clamp(forward + correction, -100, 100)
-        if LOG:
-            print(now, round(left, 2), round(right, 2), round(error, 2), round(d_term, 1),
-                  int(left_speed), int(right_speed))
-        elif time.ticks_diff(now, next_print) >= 0:
-            next_print = time.ticks_add(now, PRINT_MS)
-            print("left:", round(left, 2), "right:", round(right, 2), "l-r:", round(left - right, 2),
-                  "error:", round(error, 2), "d:", round(d_term, 1), "fwd:", round(forward),
-                  "L:", left_speed, "R:", right_speed)
-        LeftMotor.drive(left_speed, 0)
-        RightMotor.drive(right_speed, 1)
+            # a different color can beep right away; the same color waits out the cooldown
+            cooled_down = (seen_color != last_beep_color
+                           or time.ticks_diff(now, last_beep) >= MARKER_COOLDOWN)
+            if seen_reads == STABLE_COUNT and cooled_down:
+                print("marker:", seen_color)
+                BEEP_FUNCS[seen_color]()
+                send_marker(seen_color)
+                last_beep = now
+                last_beep_color = seen_color
 
-finally:
-    # runs when you press Ctrl+C (or on a crash) so the robot doesn't keep driving
-    LeftMotor.stop()
-    RightMotor.stop()
-    buzzer.duty_u16(0)
-    set_lights((0, 0, 0))
+            if left < LEFT_WHITE - LEFT_MARGIN:
+                tape_side = "left"
+            elif right < RIGHT_DARK:
+                tape_side = "right"
+            both_white = left > LOST_LEFT and right > LOST_RIGHT
+            if both_white:
+                white_steps += 1
+            else:
+                white_steps = 0
+            if white_steps >= LOST_STEPS:
+                if lost_since is None:
+                    lost_since = time.ticks_ms()
+                if time.ticks_diff(time.ticks_ms(), lost_since) > LOST_TIMEOUT:
+                    print("Lost the line, stopping")
+                    break
+                skip_d = True               # the first derivative after finding the line would be stale
+                if LOG:
+                    print(now, round(left, 2), round(right, 2), "LOST")
+                if tape_side == "left":
+                    # the tape was last under the left sensor -- pivot left: right wheel drives
+                    print("lost -- searching left")
+                    RightMotor.drive(LOST_SPEED, 1)
+                    LeftMotor.stop()
+                else:
+                    # the tape was last under the right sensor -- pivot right: left wheel drives
+                    print("lost -- searching right")
+                    LeftMotor.drive(LOST_SPEED, 0)
+                    RightMotor.stop()
+                continue
+            lost_since = None
+
+            left_dark = max(0, LEFT_WHITE - left - LEFT_MARGIN)
+            edge_error = (LEFT_WHITE - right) - target       # positive = right sensor too far onto the tape
+            if left_dark > 0:
+                error = CORNER_GAIN * left_dark + max(0, edge_error)   # tape under the left sensor: turn left
+            elif both_white and tape_side == "left":
+                error = abs(edge_error)                                # tape is on the left: turn left
+            else:
+                error = edge_error
+            if abs(error) > STUCK_ERROR and error * last_error > 0:
+                stuck_steps += 1
+            else:
+                stuck_steps = 0
+            if stuck_steps >= STUCK_STEPS:
+                print("Turning one way without finding the line, stopping")
+                break
+            if skip_d:
+                last_error = error          # first step, or just found the line: no derivative kick
+                skip_d = False
+            derivative = error - last_error
+            last_error = error
+            d_term = clamp(Kd * derivative, -MAX_D_TERM, MAX_D_TERM)
+            correction = (Kp * error) + d_term
+            forward = max(MIN_BASE, base - SLOW_FACTOR * abs(error))
+            left_speed = clamp(forward - correction, -100, 100)    # negative = wheel reverses
+            right_speed = clamp(forward + correction, -100, 100)
+            if LOG:
+                print(now, round(left, 2), round(right, 2), round(error, 2), round(d_term, 1),
+                      int(left_speed), int(right_speed))
+            elif time.ticks_diff(now, next_print) >= 0:
+                next_print = time.ticks_add(now, PRINT_MS)
+                print("left:", round(left, 2), "right:", round(right, 2), "l-r:", round(left - right, 2),
+                      "error:", round(error, 2), "d:", round(d_term, 1), "fwd:", round(forward),
+                      "L:", left_speed, "R:", right_speed)
+            LeftMotor.drive(left_speed, 0)
+            RightMotor.drive(right_speed, 1)
+
+    finally:
+        # runs when you press Ctrl+C (or on a crash) so the robot doesn't keep driving
+        LeftMotor.stop()
+        RightMotor.stop()
+        buzzer.duty_u16(0)
+        set_lights((0, 0, 0))
 
 
 # tune
+
+
