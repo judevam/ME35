@@ -158,12 +158,12 @@ BEEP_FUNCS = {"red": beepRed, "green": beepGreen, "blue": beepBlue}
 
 
 # add p controller
-base = 40
-Kp = 125
+base = 25
+Kp = 140
 # left - right when the robot is in the ideal spot (left on white, right on black).
 target = 0.38
 
-Kd = 100
+Kd = 120
 
 
 # what to do if it lost the line
@@ -193,12 +193,12 @@ STUCK_ERROR = 0.25
 STUCK_STEPS = 16         # 16 steps = 0.8 s
 stuck_steps = 0
 LOST_SPEED = 20          # speed of the driving wheel while searching (the other wheel stops)
-LOST_TIMEOUT = 2000      # ms of searching before giving up and stopping
+LOST_TIMEOUT = 10000      # ms of searching before giving up and stopping
 lost_since = None
 last_error = 0           # last error seen on the line: decides which way to search when lost
 
 # slow down in turns: forward speed drops as the error grows
-SLOW_FACTOR = 50         # speed lost per 1.0 of |error| -- raise to slow down more in turns
+SLOW_FACTOR = 40         # speed lost per 1.0 of |error| -- raise to slow down more in turns
 MIN_BASE = 12            # never slow below this (motors stall at very low speeds)
 
 # color markers on the line: each color plays its own melody (beepRed, beepGreen, beepBlue)
